@@ -20,7 +20,7 @@ W_B = np.random.randn(2, 4)
 
 output = lora_forward_matmul(x, W, W_A, W_B)
 
-print("--- Resultados ---")
-print("Entrada (x):", x.shape)
-print("Saída da camada com LoRA:", output)
-print("Formato da saída:", output.shape)
+print("--- Results ---")
+print(f"Input {x.shape}")
+print(f"Output LoRA: {output}")
+print(f"Formatted output: {output.shape}")
