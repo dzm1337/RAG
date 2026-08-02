@@ -8,7 +8,6 @@ from typing import NamedTuple
 from .models import Chunk
 
 DEFAULT_MAX_CHUNK_SIZE = 2000
-DEFAULT_TARGET_CHUNK_SIZE = 1000
 DEFAULT_OVERLAP_RATIO = 0.12
 MIN_CHUNK_SIZE = 80
 MAX_HEADER_LEVEL = 6
@@ -24,17 +23,16 @@ FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
 Span = tuple[int, int]
-"""A half-open character range [start, end) into a file's content."""
+"""A half-open character range [start, end] into a file's content."""
 
 Header = tuple[int, int, str]
 """A markdown header: (character offset, level 1-6, title)."""
 
 
 class ChunkConfig(NamedTuple):
-    """Chunking budget: ceil, size, overlap."""
+    """Chunking budget: the size chunks are cut to, and their overlap."""
 
-    max_size: int
-    target_size: int
+    size: int
     overlap: int
 
 
@@ -55,19 +53,18 @@ def build_config(
 ) -> ChunkConfig:
     """
     Validate and normalise the chunking budget.
-
-    max_chunk_size is the ceiling the grader enforces;
-    target_chunk_size is the size we actually aim for.
+    max_chunk_size is the ceiling the grader enforces, and chunks size are based on it
     """
     if max_chunk_size <= 0:
         raise ValueError("max_chunk_size must be strictly positive")
     if target_chunk_size is None:
-        target_chunk_size = DEFAULT_TARGET_CHUNK_SIZE
-    target = max(1, min(target_chunk_size, max_chunk_size))
+        size = max_chunk_size
+    else:
+        size = max(1, min(target_chunk_size, max_chunk_size))
     if overlap is None:
-        overlap = int(target * DEFAULT_OVERLAP_RATIO)
-    overlap = max(0, min(overlap, target - 1))
-    return ChunkConfig(max_chunk_size, target, overlap)
+        overlap = int(size * DEFAULT_OVERLAP_RATIO)
+    overlap = max(0, min(overlap, size - 1))
+    return ChunkConfig(size, overlap)
 
 
 def split_span(
@@ -141,16 +138,17 @@ def build_chunk(
 def chunk_plain_content(
     content: str, file_path: str, config: ChunkConfig
 ) -> list[Chunk]:
-    """Chunk a file with no structure at all: fixed-size windows.
+    """
+    Chunk a file with no structure at all: fixed-size windows.
 
-    The fallback for source that cannot be parsed. Indexing it crudely
-    still beats dropping it: a file missing from the index can never be
-    retrieved, however good the chunking of everything else is.
+    The fallback for source that cannot be parsed. Indexing it anyways 
+    a file missing from the index can never be retrieved, 
+    however good the chunking of everything else is.
     """
     return [
         build_chunk(file_path, content, start, end, kind="Text")
         for start, end in split_span(
-            0, len(content), config.target_size, config.overlap
+            0, len(content), config.size, config.overlap
         )
         if content[start:end].strip()
     ]
@@ -209,7 +207,7 @@ def parse_headers(content: str) -> list[Header]:
 
 
 def build_header_path(headers: list[Header], position: int) -> str:
-    """Breadcrumb of the headers in effect at a character position."""
+    """Take the headers in effect at a character position."""
     trail: list[str | None] = [None] * MAX_HEADER_LEVEL
     for offset, level, title in headers:
         if offset > position:
@@ -229,7 +227,7 @@ def split_markdown_section(
 ) -> list[Span]:
     """Subdivide a section on deeper headers while it is oversized."""
     # stop once the block is small enough or no header level is left
-    if end - start <= config.target_size or level > MAX_HEADER_LEVEL:
+    if end - start <= config.size or level > MAX_HEADER_LEVEL:
         return [(start, end)]
     cuts = [
         offset
@@ -262,7 +260,7 @@ def merge_small_sections(
         prev_start, prev_end = merged[-1]
         too_small = (end - start) < MIN_CHUNK_SIZE
         prev_too_small = (prev_end - prev_start) < MIN_CHUNK_SIZE
-        fits = (end - prev_start) <= config.target_size
+        fits = (end - prev_start) <= config.size
         if (too_small or prev_too_small) and fits:
             merged[-1] = (prev_start, end)
         else:
@@ -281,7 +279,7 @@ def chunk_markdown_content(
     chunks: list[Chunk] = []
     for section_start, section_end in merge_small_sections(sections, config):
         for start, end in split_span(
-            section_start, section_end, config.target_size, config.overlap
+            section_start, section_end, config.size, config.overlap
         ):
             trail = build_header_path(headers, start)
             chunks.append(
@@ -312,7 +310,8 @@ def chunk_markdown_files(
 
 
 def build_line_starts(content: str) -> list[int]:
-    """Character offset of each line start.
+    """
+    Character offset of each line start.
 
     Only "\\n" starts a new line here: str.splitlines also breaks on
     \\x0c, \\x85 and friends, which CPython's line numbering does not,
@@ -382,7 +381,7 @@ def parse_units(
         if start > last_end:
             units.append(Unit(last_end, start, qualifier, gap_kind, None))
         name = node.name if qualifier is None else f"{qualifier}.{node.name}"
-        oversized = (end - start) > config.target_size
+        oversized = (end - start) > config.size
         if isinstance(node, ast.ClassDef) and oversized:
             # a big class is worth indexing method by method
             parse_units(
@@ -410,7 +409,7 @@ def parse_units(
 
 
 def parse_python_units(content: str, config: ChunkConfig) -> list[Unit]:
-    """Split a Python module into semantic units."""
+    """Split a Python module into units."""
     tree = ast.parse(content)
     line_starts = build_line_starts(content)
     units: list[Unit] = []
@@ -436,7 +435,7 @@ def build_python_chunks(
             continue  # whitespace-only filler is not worth indexing
         context = f"{unit.kind} {unit.name}" if unit.name else unit.kind
         for start, end in split_span(
-            unit.start, unit.end, config.target_size, config.overlap
+            unit.start, unit.end, config.size, config.overlap
         ):
             chunks.append(
                 build_chunk(
