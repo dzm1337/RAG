@@ -30,16 +30,11 @@ class Index(NamedTuple):
         """Number of indexed chunks"""
         return len(self.doc_len)
 
-    def postings(self, term: str) -> tuple[Array, Array]:
+    def postings(self, term_id: int) -> tuple[Array, Array]:
         """
         Documents containing 'term' and their term frequencies
         Term X occurs in document Y, tf times.
         """
-        term_id = self.vocab.get(term, None)
-        if term_id is None:
-            # if it doesn't exist we return an empty tuple
-            empty = np.empty(0, dtype=np.int32)
-            return empty, empty
         start, end = self.idxptr[term_id], self.idxptr[term_id + 1]
         return self.doc_ids[start:end], self.tfs[start:end]
 
@@ -92,7 +87,18 @@ def pack_postings(
     doc_len: Array,
     sources: list[MinimalSource],
 ) -> Index:
-    n_terms, n_docs = len(vocab), len(doc_len)
+    """
+    Group (term, document, tf) into CSR arrays
+
+    sort them by term id puts each term's postings together, so idxptr
+    only has to remember where each block starts. Using stable sort
+    we keep doc_ids ascending inside a block
+
+    df: with one posting per term-document pair, counting term ids counts
+    documents. idf is derived from it here.
+    """
+    n_terms = len(vocab)
+    n_docs = len(doc_len)
     terms = np.asarray(term_ids, dtype=np.int32)
     order = np.argsort(terms, kind="stable")
 
@@ -111,20 +117,15 @@ def pack_postings(
         sources=sources
     )
 
-corpus: list[Chunk] = chunk_corpus()
-short_corpus: list[Chunk] = [x for x in corpus[:2]]
-index = build_index(short_corpus)
-#terms = sorted(index.vocab, key=lambda term: index.vocab[term])
-terms = [term for term in index.vocab]
-terms_sorted = sorted(index.vocab, key=lambda term: index.vocab[term])
-
-print(f"Normal: \n\n\n\n{index.vocab}\n\n")
-print(f"Sorted: {terms_sorted}\n\n\n")
-print(f"Not Sorted: {terms}")
-print(terms_sorted == terms)
-
-
 def save_index(index: Index, directory: str | Path) -> None:
+    """
+    Save index in directory as files
+
+    Numeric arrays go to 'postings.npz' the terms to 'vocab.json'
+    in term-id order, the document locations to 'sources.json'
+
+    .npz is a zip archive holding one .npy per array each .npy
+    """
     path = Path(directory)
     path.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -135,58 +136,107 @@ def save_index(index: Index, directory: str | Path) -> None:
         idf=index.idf,
         doc_len=index.doc_len,
     )
-    #terms = sorted(index.vocab, key=lambda term: index.vocab[term])
-    #terms = [""] * len(index.vocab)
-    #for term, term_id in index.vocab.items():
-    #    terms[term_id] = term
     terms = list(index.vocab)
     (path / "vocab.json").write_text(json.dumps(terms), encoding="utf-8")
     (path / "sources.json").write_text(json.dumps([src.model_dump() for src in index.sources]), encoding="utf-8")
 
+def load_index(directory: str | Path) -> Index:
+    """Load an index written by save_index"""
 
-
-"""
-print("All the postings, in the order they were collected")
-
-inv = {v: k for k, v in vocab.items()}
-print(f"term term_id doc tf\n")
-
-for ti, d, tf in zip(term_ids, doc_ids, tfs):
-    print(f"{inv[ti]} {ti} {d} {tf}")
-
-print(f"{len(term_ids)} postings")
-
-print("Sort by term_id, so each term rows are together")
-
-terms = np.asarray(term_ids)
-order = np.argsort(terms, kind="stable")
-doc_ids = np.asarray(doc_ids)[order]
-tfs = np.asarray(tfs)[order]
-df = np.bincount(terms, minlength=len(vocab))
-idxptr = np.zeros(len(vocab) + 1, dtype=np.int64)
-np.cumsum(df, out=idxptr[1:])
-
-print(f"row term term_id doc tf\n")
-
-for row, (ti, d, tf) in enumerate(zip(terms[order], doc_ids, tfs)):
-    mark = " <-- created" if row in idxptr[:-1] else ""
-    print(f"{row} {inv[ti]} {ti} {d} {tf}{mark}")
-
-print()
-print("let the term column, stick with the boundaries")
-
-print(f"doc_ids: {list(doc_ids)}")
-print(f"tfs: {list(tfs)}")
-print(f"idxptr: {list(idxptr)}")
-print(f"vocab: {vocab}")
-print()
-
-print("Reading it again:")
-
-for term, tid in vocab.items():
-    s, e = idxptr[tid], idxptr[tid + 1]
-    print(
-        f"{term} rows {s}..{e-1} docs{list(doc_ids[s:e])}"
-        f"\ttf={list(tfs[s:e])} df={e-s}"
+    path = Path(directory)
+    with np.load(path / "postings.npz") as arrays:
+        idxptr = arrays["idxptr"]
+        doc_ids = arrays["doc_ids"]
+        tfs = arrays["tfs"]
+        idf = arrays["idf"]
+        doc_len = arrays["doc_len"]
+    terms = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
+    raw = json.loads((path / "sources.json").read_text(encoding="utf-8"))
+    return Index(
+        vocab={term: i for i, term in enumerate(terms)},
+        idxptr=idxptr,
+        doc_ids=doc_ids,
+        tfs=tfs,
+        idf=idf,
+        doc_len=doc_len,
+        avgdl=float(doc_len.mean()) if len(doc_len) else 0.0,
+        sources = [MinimalSource(**item) for item in raw]
     )
-"""
+
+def bm25(
+    index: Index,
+    query: str,
+    top_k: int = 10,
+    k1: float = 1.2,
+    b: float = 0.75,
+    tokenizer: Callable[[str], list[str]] = tokenize,
+) -> list[MinimalSource]:
+    k = min(index.n_chunks, top_k)
+    if not k:
+        return []
+    scores = np.zeros(index.n_chunks, np.float32)
+    for term in tokenizer(query):
+        term_id = index.vocab.get(term, None)
+        if term_id is None:
+            continue
+        docs, tf = index.postings(term_id)
+        dl = index.doc_len[docs]
+        denom = tf + k1 * (1 - b + b * dl / index.avgdl)
+        scores[docs] += index.idf[term_id] * tf * (k1 + 1) / denom
+    best = np.argpartition(scores, -k)[-k:]
+    top = best[np.argsort(scores[best])[::-1]]
+    return [index.sources[i] for i in top]
+
+if __name__ == "__main__":
+    import sys
+
+    processed = Path("data/processed")
+    default = "How do I serve a LoRA adapter with the OpenAI server?"
+
+    if (processed/"postings.npz").exists():
+        index = load_index(processed)
+    else:
+        index = build_index(chunk_corpus())
+        save_index(index, processed)
+
+    query = " ".join(sys.argv[1:]) if sys.argv[1:] else default
+    print(f"query: {query}")
+    print(f"index: {index.n_chunks} chunks, {len(index.vocab)} terms\n")
+
+    def preview(source, width = 160):
+        text = Path(source.file_path).read_text(encoding="utf-8")
+        chunk = text[source.first_character_index:source.last_character_index]
+        return " ".join(chunk.split())[:width]
+
+    def explain(
+        index: Index,
+        query: str,
+        doc_id: int,
+        k1: float = 1.2,
+        b: float = 0.75,
+        tokenizer: Callable[[str], list[str]] = tokenize,
+    ) -> list[tuple[str, float]]:
+        rows: list[tuple[str, float, float]] = []
+        for term in tokenizer(query):
+            term_id = index.vocab.get(term, None)
+            if term_id is None:
+                continue
+            docs, tf = index.postings(term_id)
+            dl = index.doc_len[docs]
+            denom = tf + k1 * (1 - b + b * dl / index.avgdl)
+            scores = np.zeros(index.n_chunks, np.float32)
+            scores[docs] = index.idf[term_id] * tf * (k1 + 1) / denom
+            rows.append((term, float(index.idf[term_id]), float(scores[doc_id])))
+        return sorted(rows, key=lambda row: -row[2])
+
+    results = bm25(index, query, top_k=5)
+    for rank, source in enumerate(results, start=1):
+        print(f"{rank}: {source.file_path}"
+              f"[{source.first_character_index}:"
+              f"{source.last_character_index}]")
+        print(f"{preview(source)}\n")
+
+    doc_id = index.sources.index(results[0])
+
+    for term, idf, score in explain(index, query, doc_id)[:10]:
+        print(f"   {term} - idf {idf:.2f} - score {score:.2f}")
